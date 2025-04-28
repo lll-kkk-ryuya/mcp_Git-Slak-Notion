@@ -1,21 +1,11 @@
-# daily_report.py
-"""Generate a simple one-shot "1 日 3 行" 日報
-
-Uses OpenAI for LLM summarization, and MCP servers via SSE.
-Configuration (endpoints & IDs) comes entirely from .env.
-"""
-
-from __future__ import annotations
-
 import asyncio
 import os
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
-import openai
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 import mcp.types as types
@@ -77,78 +67,123 @@ def unwrap_content(raw: list[types.Content]) -> list[dict]:
     return data_items
 
 async def post_mcp(url: str, tool: str, args: dict) -> list[dict]:
-    """Generic helper to open SSE and call an MCP tool, returning list of dicts."""
+    """Generic helper to open SSE and call an MCP tool, returning list of dicts or texts."""
     async with sse_client(url.rstrip('/')) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(name=tool, arguments=args)
             content_items = unwrap_content(result.content)
-            # If embedded JSON list, unwrap it
             if len(content_items) == 1 and isinstance(content_items[0], list):
                 return content_items[0]
             return content_items
 
 # ---------------------------------------------------------------------------
-# Summarization
+# Main
 # ---------------------------------------------------------------------------
-def summarize_with_llm(commits: list[dict]) -> str:
-    """Take commit messages and return a 3-line Japanese summary via the new OpenAI Python client."""
-    lines = [c.get('commit', {}).get('message', '').split('\n')[0] for c in commits]
+async def main() -> None:
+    today_date = date.today()
+    today = today_date.isoformat()
+
+    # 1. Fetch today's commits across main
+    commits = await post_mcp(
+        GITHUB_MCP_URL,
+        'list_commits',
+        {
+            'owner': GH_OWNER, 'repo': GH_REPO,
+            'since': f"{today}T00:00:00Z",
+            'until': f"{today}T23:59:59Z"
+        }
+    )
+    if not commits:
+        print("ℹ️ No commits today – skipping.")
+        return
+
+    # 2. Determine base and head for overall diff
+    if len(commits) > 1:
+        base_sha = commits[-1]['sha']
+        head_sha = commits[0]['sha']
+    else:
+        # Only one commit: compare with yesterday's latest
+        yesterday = today_date - timedelta(days=1)
+        prev = await post_mcp(
+            GITHUB_MCP_URL,
+            'list_commits',
+            {
+                'owner': GH_OWNER, 'repo': GH_REPO,
+                'since': f"{yesterday.isoformat()}T00:00:00Z",
+                'until': f"{yesterday.isoformat()}T23:59:59Z"
+            }
+        )
+        base_sha = prev[0]['sha'] if prev else commits[0]['sha']
+        head_sha = commits[0]['sha']
+
+    # 3. Fetch overall diff via compare_commits
+    overall = await post_mcp(
+        GITHUB_MCP_URL,
+        'compare_commits',
+        {
+            'owner': GH_OWNER, 'repo': GH_REPO,
+            'base': base_sha, 'head': head_sha
+        }
+    )
+    overall_diff = overall[0] if overall else ""
+
+    # 4. Fetch feature-branch commits and diff
+    branch = os.getenv('TARGET_BRANCH', 'feature-branch')
+    branch_commits = await post_mcp(
+        GITHUB_MCP_URL,
+        'list_commits',
+        {
+            'owner': GH_OWNER, 'repo': GH_REPO,
+            'sha': branch,
+            'since': f"{today}T00:00:00Z"
+        }
+    )
+    if branch_commits:
+        b_base = branch_commits[-1]['sha']
+        b_head = branch_commits[0]['sha']
+        branch_res = await post_mcp(
+            GITHUB_MCP_URL,
+            'compare_commits',
+            {'owner': GH_OWNER, 'repo': GH_REPO, 'base': b_base, 'head': b_head}
+        )
+        branch_diff = branch_res[0] if branch_res else ""
+    else:
+        branch_diff = ""
+
+    # 5. Summarize with LLM including diffs and branch context
     prompt = (
-        "あなたは優秀な開発者向けの日報生成AIです。"
-        "以下のコミットメッセージを3行の日本語で要約してください。\n\n" +
-        "\n".join('- ' + l for l in lines)
+        f"【日付: {today}】\n"
+        "以下の変更内容をもとに、3行の日本語日報を作成してください。\n\n"
+        "■ 全体差分（mainブランチ）:\n" + overall_diff + "\n\n"
+        f"■ `{branch}` ブランチでの実装差分:\n" + branch_diff
     )
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
-    return resp.choices[0].message.content.strip()
+    summary = resp.choices[0].message.content.strip()
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-async def main() -> None:
-    today = date.today().isoformat()
-
-    # 1. Fetch commits
-    commits = await post_mcp(
-        GITHUB_MCP_URL,
-        'list_commits',
-        {'owner': GH_OWNER, 'repo': GH_REPO, 'sha': 'main', 'since': f"{today}T00:00:00Z"}
-    )
-    if not commits:
-        print("ℹ️ No commits – skipping.")
-        return
-
-    # 2. Summarize with LLM
-    summary = summarize_with_llm(commits)
+    # 6. Post to Slack
     body = f"【{today}】 3行日報\n{summary}"
     print(body)
-    
-    # 3. Post to Slack
-    slack_result = await post_mcp(
+    await post_mcp(
         SLACK_MCP_URL,
         'slack_post_message',
         {'channel_id': SLACK_CHANNEL_ID, 'text': body},
     )
-    
-    # 4. Create Notion page using proper create-page args
+
+    # 7. Create Notion page
     props = {
         'Date': {'date': {'start': today}},
         'Summary': {'rich_text': [{'text': {'content': summary}}]}
     }
-    notion_result = await post_mcp(
+    await post_mcp(
         NOTION_MCP_URL,
         'create-page',
-        {
-            'parent_type': 'database_id',
-            'parent_id': NOTION_DB_ID,
-            'properties': json.dumps(props)
-        }
+        {'parent_type': 'database_id', 'parent_id': NOTION_DB_ID, 'properties': json.dumps(props)}
     )
-    print("Notion post result:", notion_result)
 
     print("✅ Daily report with LLM summary sent!")
 
